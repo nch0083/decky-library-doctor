@@ -1,0 +1,69 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "package version: $VERSION"
+          echo "tag version:     $TAG_VERSION"
+          if [ "$VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION does not match package.json version $VERSION"
+            exit 1
+          fi
+
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Package Decky plugin
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          rm -rf out
+          mkdir -p out/LibraryDoctor/dist
+          cp dist/index.js out/LibraryDoctor/dist/index.js
+          cp package.json plugin.json main.py README.md LICENSE out/LibraryDoctor/
+          (
+            cd out
+            zip -qr "LibraryDoctor-v${VERSION}.zip" LibraryDoctor
+          )
+          ls -lh "out/LibraryDoctor-v${VERSION}.zip"
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          gh release create "$GITHUB_REF_NAME"             "out/LibraryDoctor-v${VERSION}.zip"             --title "Library Doctor $GITHUB_REF_NAME"             --generate-notes
