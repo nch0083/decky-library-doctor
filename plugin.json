@@ -1,0 +1,17 @@
+{
+  "name": "Library Doctor",
+  "author": "nach",
+  "flags": [
+    "debug"
+  ],
+  "api_version": 1,
+  "publish": {
+    "tags": [
+      "library",
+      "non-steam",
+      "cleanup"
+    ],
+    "description": "Clean broken and duplicate non-Steam shortcuts, find unregistered game EXEs, and review/delete games queued in the DEL collection."
+  },
+  "version": "0.17.2"
+}
