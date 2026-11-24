@@ -13,5 +13,6 @@
     ],
     "description": "Clean broken and duplicate non-Steam shortcuts, find unregistered game EXEs, and review/delete games queued in the DEL collection."
   },
-  "version": "0.17.2"
+  "version": "0.17.3",
+  "repository": "https://github.com/nch0083/decky-library-doctor"
 }
