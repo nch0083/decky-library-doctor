@@ -1,6 +1,6 @@
 {
   "name": "decky-library-doctor",
-  "version": "0.17.2",
+  "version": "0.17.3",
   "description": "Library Doctor: clean non-Steam shortcuts, discover game EXEs, and safely delete DEL-collection games with path review.",
   "type": "module",
   "scripts": {
@@ -38,5 +38,13 @@
         "react-dom"
       ]
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nch0083/decky-library-doctor.git"
+  },
+  "homepage": "https://github.com/nch0083/decky-library-doctor",
+  "bugs": {
+    "url": "https://github.com/nch0083/decky-library-doctor/issues"
   }
 }
