@@ -2,8 +2,9 @@ name: Build and Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -27,28 +28,47 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
-
-      - name: Verify tag matches package version
+      - name: Read version
+        id: version
         shell: bash
         run: |
           VERSION="$(node -p "require('./package.json').version")"
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          echo "package version: $VERSION"
-          echo "tag version:     $TAG_VERSION"
-          if [ "$VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::Tag v$TAG_VERSION does not match package.json version $VERSION"
+          PLUGIN_VERSION="$(node -p "require('./plugin.json').version")"
+          if [ "$VERSION" != "$PLUGIN_VERSION" ]; then
+            echo "::error::package.json ($VERSION) and plugin.json ($PLUGIN_VERSION) versions do not match"
             exit 1
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check existing release
+        id: existing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists; build/release will be skipped."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.existing.outputs.exists != 'true'
+        run: pnpm install --no-frozen-lockfile
 
       - name: Build frontend
+        if: steps.existing.outputs.exists != 'true'
         run: pnpm run build
 
       - name: Package Decky plugin
+        if: steps.existing.outputs.exists != 'true'
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="$(node -p "require('./package.json').version")"
           rm -rf out
           mkdir -p out/LibraryDoctor/dist
           cp dist/index.js out/LibraryDoctor/dist/index.js
@@ -59,13 +79,16 @@ jobs:
           )
           ls -lh "out/LibraryDoctor-v${VERSION}.zip"
 
-      - name: Create GitHub Release
+      - name: Create tag and GitHub Release
+        if: steps.existing.outputs.exists != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
-          VERSION="$(node -p "require('./package.json').version")"
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$TAG" \
             "out/LibraryDoctor-v${VERSION}.zip" \
-            --title "Library Doctor $GITHUB_REF_NAME" \
+            --target "$GITHUB_SHA" \
+            --title "Library Doctor $TAG" \
             --generate-notes
