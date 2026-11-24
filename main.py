@@ -998,3 +998,305 @@ class Plugin:
         settings = self._load_settings()
         set_phase("duplicate_groups", "grouping duplicate shortcuts")
         duplicate_groups = self._duplicate_groups(items)
+        set_phase("duplicate_roots", f"{len(duplicate_groups)} duplicate group(s)", duplicateGroups=len(duplicate_groups))
+        watched = [Path(self._canonical_path(str(x))) for x in settings.get("watchedFolders", []) if x]
+        for group in duplicate_groups:
+            exe = group.get("exe", "")
+            inferred = None
+            # Prefer the longest matching watched folder so nested scan roots behave predictably.
+            matching = []
+            for wf in watched:
+                try:
+                    Path(self._canonical_path(exe)).relative_to(wf)
+                    matching.append(wf)
+                except (ValueError, OSError):
+                    continue
+            for wf in sorted(matching, key=lambda x: len(str(x)), reverse=True):
+                inferred, _confidence = self._infer_game_root(exe, wf)
+                if inferred:
+                    break
+            group_root = self._canonical_path(inferred) if inferred else self._canonical_path(str(Path(exe).parent))
+            group["gameRoot"] = group_root
+            group["gameName"] = Path(group_root).name or Path(exe).stem
+        watched_folders = [str(x) for x in settings.get("watchedFolders", []) if x]
+        set_phase("prepare_folder_scan", f"{len(watched_folders)} watched folder(s)", root_folder=(watched_folders[0] if watched_folders else ""))
+        unregistered, folder_error, truncated, scan_cancelled = self._scan_unregistered_exes(
+            [item.get("exe", "") for item in items],
+            settings,
+            cancel_event,
+            scan_id,
+        )
+        # Paths emitted by _scan_unregistered_exes are already canonical. Avoid
+        # resolving every result again here; on removable media realpath() can be
+        # surprisingly expensive and made large scans appear to hang after walking
+        # had already finished.
+        self._record_scan_checkpoint(scan_id, "worker:folder-scan-returned", f"unregistered={len(unregistered)} cancelled={scan_cancelled}")
+        set_phase("filter_ignored", f"{len(unregistered)} discovered EXE(s)", unregisteredFound=len(unregistered))
+        ignored_set = {self._canonical_path(x) for x in settings.get("ignoredExecutables", []) if x}
+        ignored = [x for x in unregistered if x.get("path", "") in ignored_set]
+        unregistered = [x for x in unregistered if x.get("path", "") not in ignored_set]
+        set_phase("build_result", f"{len(unregistered)} unregistered / {len(ignored)} ignored", unregisteredFound=len(unregistered))
+        self._record_scan_checkpoint(scan_id, "worker:result-build-start", f"unregistered={len(unregistered)} ignored={len(ignored)}")
+        result = {
+            "total": len(items),
+            "healthy": sum(1 for x in visible_items if x["status"] == "healthy"),
+            "missing": sum(1 for x in visible_items if x["status"] == "missing"),
+            "storageOffline": sum(1 for x in visible_items if x["status"] == "storage_offline"),
+            "invalid": sum(1 for x in visible_items if x["status"] == "invalid"),
+            "filteredUtilities": sum(1 for x in items if x.get("utilityShortcut")),
+            "duplicateGroups": duplicate_groups,
+            "duplicateShortcuts": sum(group["count"] - 1 for group in duplicate_groups),
+            "unregisteredExecutables": unregistered,
+            "ignoredExecutables": ignored,
+            "watchedFolders": settings.get("watchedFolders", []),
+            "folderScanError": folder_error,
+            "folderScanTruncated": truncated,
+            "scanCancelled": scan_cancelled,
+            "items": items,
+        }
+        self._record_scan_checkpoint(scan_id, "worker:result-build-done", f"items={len(items)}")
+        set_phase("returning", "worker return imminent")
+        self._record_scan_checkpoint(scan_id, "worker:return-imminent", "about to return ScanResult from worker thread")
+        return result
+
+    async def start_scan(self):
+        """Start a background scan and return immediately with its scan id.
+
+        This avoids holding a long-lived Decky RPC request open while the filesystem
+        worker runs. Some Decky builds can leave the frontend promise pending even
+        after the Python coroutine has finished, especially while status polling is
+        happening concurrently.
+        """
+        cancel_event = threading.Event()
+        with self._scan_state_lock:
+            self._scan_sequence += 1
+            scan_id = self._scan_sequence
+            previous = self._active_scan_event
+            if previous is not None:
+                previous.set()
+            self._active_scan_event = cancel_event
+            now = time.time()
+            self._last_scan_result = None
+            self._last_scan_result_id = scan_id
+            self._last_scan_error = None
+            self._scan_state = {
+                "active": True, "scanId": scan_id, "currentFolder": "",
+                "rootFolder": "", "visitedFolders": 0, "foundExes": 0,
+                "phase": "starting", "phaseDetail": "background scan started",
+                "startedAt": now, "phaseStartedAt": now, "lastUpdateAt": now,
+                "stopRequested": False, "resultReady": False, "resultError": None,
+                "checkpointSeq": 0, "lastCheckpoint": None, "checkpointHistory": [],
+                "workerThreadAlive": False, "futureResolved": False, "resultStored": False,
+            }
+        task = asyncio.create_task(self._run_scan_background(cancel_event, scan_id))
+        self._active_scan_task = task
+        return {"success": True, "scanId": scan_id}
+
+    async def _run_scan_background(self, cancel_event, scan_id):
+        self._record_scan_checkpoint(scan_id, "async:before-to-thread", "about to await worker thread")
+        with self._scan_state_lock:
+            if self._scan_state.get("scanId") == scan_id:
+                self._scan_state["workerThreadAlive"] = True
+        try:
+            result = await asyncio.to_thread(self._scan_shortcuts_sync, cancel_event, scan_id)
+            self._record_scan_checkpoint(scan_id, "async:to-thread-returned", "worker future resolved")
+            with self._scan_state_lock:
+                if self._scan_state.get("scanId") == scan_id:
+                    self._scan_state["workerThreadAlive"] = False
+                    self._scan_state["futureResolved"] = True
+            self._record_scan_checkpoint(scan_id, "async:before-result-store", "storing ScanResult on plugin object")
+            with self._scan_state_lock:
+                if self._scan_state.get("scanId") == scan_id:
+                    self._last_scan_result = result
+                    self._last_scan_result_id = scan_id
+                    self._last_scan_error = None
+                    self._scan_state["resultReady"] = True
+                    self._scan_state["resultStored"] = True
+                    self._scan_state["resultError"] = None
+                    self._scan_state["phaseDetail"] = "result stored; waiting for UI fetch"
+                    self._scan_state["lastUpdateAt"] = time.time()
+            self._record_scan_checkpoint(scan_id, "async:result-stored", "resultReady=true")
+        except Exception as exc:
+            decky.logger.exception("Background scan failed: %s", exc)
+            self._record_scan_checkpoint(scan_id, "async:exception", str(exc))
+            with self._scan_state_lock:
+                if self._scan_state.get("scanId") == scan_id:
+                    self._last_scan_result = None
+                    self._last_scan_result_id = scan_id
+                    self._last_scan_error = str(exc)
+                    self._scan_state["workerThreadAlive"] = False
+                    self._scan_state["futureResolved"] = True
+                    self._scan_state["resultReady"] = False
+                    self._scan_state["resultError"] = str(exc)
+                    self._scan_state["phaseDetail"] = f"scan failed: {exc}"
+                    self._scan_state["lastUpdateAt"] = time.time()
+        finally:
+            self._record_scan_checkpoint(scan_id, "async:finally-enter", "background task finalizing")
+            with self._scan_state_lock:
+                if self._scan_state.get("scanId") == scan_id:
+                    self._scan_state["active"] = False
+                    self._scan_state["currentFolder"] = ""
+                    self._scan_state["phase"] = "idle"
+                    self._scan_state["lastUpdateAt"] = time.time()
+                if self._active_scan_event is cancel_event:
+                    self._active_scan_event = None
+                if getattr(self, "_active_scan_task", None) is asyncio.current_task():
+                    self._active_scan_task = None
+            self._record_scan_checkpoint(scan_id, "async:finally-exit", "background task finalized")
+
+    async def get_scan_result(self, scan_id):
+        wanted = int(scan_id)
+        self._record_scan_checkpoint(wanted, "rpc:get-result-enter", "get_scan_result RPC entered")
+        with self._scan_state_lock:
+            result_id = self._last_scan_result_id
+            result_error = self._last_scan_error
+            result = self._last_scan_result
+        self._record_scan_checkpoint(wanted, "rpc:get-result-lock-exit", f"result_id={result_id}; has_result={result is not None}")
+        if result_id != wanted:
+            envelope = {"ready": False, "scanId": wanted, "result": None, "error": None}
+        elif result_error:
+            envelope = {"ready": False, "scanId": wanted, "result": None, "error": result_error}
+        elif result is None:
+            envelope = {"ready": False, "scanId": wanted, "result": None, "error": None}
+        else:
+            envelope = {"ready": True, "scanId": wanted, "result": result, "error": None}
+        self._record_scan_checkpoint(wanted, "rpc:get-result-return", f"ready={envelope['ready']}; returning envelope")
+        return envelope
+
+    async def get_scan_result_json(self, scan_id):
+        """Return the completed scan as one pre-serialized JSON string.
+
+        Decky's Python bridge can stall while recursively serializing a large nested
+        ScanResult object even after this coroutine has returned. Serializing here
+        keeps the bridge payload to a single primitive string and also gives us a
+        precise checkpoint if JSON encoding itself ever fails.
+        """
+        wanted = int(scan_id)
+        self._record_scan_checkpoint(wanted, "rpc-json:enter", "get_scan_result_json RPC entered")
+        with self._scan_state_lock:
+            result_id = self._last_scan_result_id
+            result_error = self._last_scan_error
+            result = self._last_scan_result
+        if result_id != wanted:
+            envelope = {"ready": False, "scanId": wanted, "result": None, "error": None}
+        elif result_error:
+            envelope = {"ready": False, "scanId": wanted, "result": None, "error": result_error}
+        elif result is None:
+            envelope = {"ready": False, "scanId": wanted, "result": None, "error": None}
+        else:
+            envelope = {"ready": True, "scanId": wanted, "result": result, "error": None}
+        self._record_scan_checkpoint(wanted, "rpc-json:encode-start", f"ready={envelope['ready']}")
+        try:
+            # File names on Linux may contain undecodable byte sequences. Python
+            # represents those with surrogateescape code points; ensure_ascii=False
+            # can then fail when the bridge encodes the JSON string as UTF-8.
+            # ASCII-escaped JSON is safe for arbitrary filesystem names and the
+            # frontend's JSON.parse() restores ordinary Unicode transparently.
+            payload = json.dumps(
+                envelope,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            payload_bytes = len(payload.encode("ascii"))
+            self._record_scan_checkpoint(wanted, "rpc-json:encoded", f"payload={payload_bytes} bytes")
+            return payload
+        except Exception as exc:
+            # Never let result serialization surface as an opaque Decky Python
+            # exception. Return a small, guaranteed-safe JSON error envelope.
+            self._record_scan_checkpoint(wanted, "rpc-json:encode-error", repr(exc))
+            safe_error = {
+                "ready": False,
+                "scanId": wanted,
+                "result": None,
+                "error": f"Scan result serialization failed: {type(exc).__name__}: {exc!r}",
+            }
+            return json.dumps(safe_error, ensure_ascii=True, separators=(",", ":"), default=str)
+
+    async def scan_shortcuts(self):
+        # Every scan owns its own cancellation token. A later scan must never
+        # clear/reuse an older worker's token, otherwise a cancelled SD-card
+        # traversal can resume in the background.
+        cancel_event = threading.Event()
+        with self._scan_state_lock:
+            self._scan_sequence += 1
+            scan_id = self._scan_sequence
+            previous = self._active_scan_event
+            if previous is not None:
+                previous.set()
+            self._active_scan_event = cancel_event
+            now = time.time()
+            self._scan_state = {
+                "active": True, "scanId": scan_id, "currentFolder": "",
+                "rootFolder": "", "visitedFolders": 0, "foundExes": 0,
+                "phase": "starting", "phaseDetail": "starting scan",
+                "startedAt": now, "phaseStartedAt": now, "lastUpdateAt": now,
+                "stopRequested": False,
+            }
+        try:
+            return await asyncio.to_thread(self._scan_shortcuts_sync, cancel_event, scan_id)
+        finally:
+            with self._scan_state_lock:
+                if self._scan_state.get("scanId") == scan_id:
+                    self._scan_state["active"] = False
+                    self._scan_state["currentFolder"] = ""
+                    self._scan_state["phase"] = "idle"
+                    self._scan_state["phaseDetail"] = "scan worker finished"
+                    self._scan_state["lastUpdateAt"] = time.time()
+                if self._active_scan_event is cancel_event:
+                    self._active_scan_event = None
+
+    async def stop_scan(self):
+        with self._scan_state_lock:
+            event = self._active_scan_event
+        if event is not None:
+            event.set()
+            self._record_scan_checkpoint(self._scan_state.get("scanId"), "ui:stop-request", "stop_scan RPC received")
+            with self._scan_state_lock:
+                self._scan_state["stopRequested"] = True
+                self._scan_state["phaseDetail"] = "stop requested; waiting for worker checkpoint"
+                self._scan_state["lastUpdateAt"] = time.time()
+        return {"success": True}
+
+    async def get_scan_status(self):
+        with self._scan_state_lock:
+            state = dict(self._scan_state)
+        now = time.time()
+        started = float(state.get("startedAt") or now)
+        phase_started = float(state.get("phaseStartedAt") or started)
+        last_update = float(state.get("lastUpdateAt") or started)
+        state["elapsedMs"] = max(0, int((now - started) * 1000))
+        state["phaseElapsedMs"] = max(0, int((now - phase_started) * 1000))
+        state["staleMs"] = max(0, int((now - last_update) * 1000))
+        return state
+
+    async def backup_shortcuts(self):
+        files = self._candidate_shortcuts_files()
+        if not files:
+            return {"success": False, "files": [], "error": "shortcuts.vdf not found"}
+
+        backup_dir = Path(decky.DECKY_PLUGIN_SETTINGS_DIR) / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        created = []
+        for i, src in enumerate(files, start=1):
+            suffix = "" if len(files) == 1 else f"_{i}"
+            dst = backup_dir / f"shortcuts_{stamp}{suffix}.vdf"
+            shutil.copy2(src, dst)
+            created.append(str(dst))
+        return {"success": True, "files": created}
+
+    async def _main(self):
+        self._scan_state_lock = threading.Lock()
+        self._active_scan_event = None
+        self._active_scan_task = None
+        self._scan_sequence = 0
+        self._last_scan_result = None
+        self._last_scan_result_id = 0
+        self._last_scan_error = None
+        now = time.time()
+        self._scan_state = {"active": False, "scanId": 0, "currentFolder": "", "rootFolder": "", "visitedFolders": 0, "foundExes": 0, "phase": "idle", "phaseDetail": "", "startedAt": now, "phaseStartedAt": now, "lastUpdateAt": now, "stopRequested": False, "resultReady": False, "resultError": None, "checkpointSeq": 0, "lastCheckpoint": None, "checkpointHistory": [], "workerThreadAlive": False, "futureResolved": False, "resultStored": False}
+        decky.logger.info("Library Doctor loaded")
+
+    async def _unload(self):
+        decky.logger.info("Library Doctor unloaded")
