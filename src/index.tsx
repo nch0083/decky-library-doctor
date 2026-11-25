@@ -439,7 +439,7 @@ function Content(){
   const [storageBusy,setStorageBusy]=useState(false);
   const [storageLimit,setStorageLimit]=useState(30);
   const [selectedStorage,setSelectedStorage]=useState<Set<string>>(new Set());
-  const [openStorageGroups,setOpenStorageGroups]=useState<Set<string>>(new Set(["internal","removable"]));
+  const [openStorageGroups,setOpenStorageGroups]=useState<Set<string>>(new Set());
   const [focusedDashboardCard,setFocusedDashboardCard]=useState<"missing"|"duplicates"|"unregistered"|"ignored"|null>(null);
   const missingSectionRef=useRef<HTMLDivElement|null>(null);
   const duplicateSectionRef=useRef<HTMLDivElement|null>(null);
@@ -601,6 +601,7 @@ function Content(){
       setStorageSummary(summary);
       setStorageLimit(30);
       setSelectedStorage(new Set());
+      setOpenStorageGroups(new Set());
     }catch(e){
       toaster.toast({title:tr("pluginName"),body:String(e)});
     }finally{setStorageBusy(false);}
