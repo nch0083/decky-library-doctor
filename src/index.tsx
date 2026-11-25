@@ -399,7 +399,6 @@ function Content(){
   const [ignoredExecutables,setIgnoredExecutables]=useState<string[]>([]);
   const [watchedFolders,setWatchedFolders]=useState<string[]>([]);
   const [recursiveFolderScan,setRecursiveFolderScan]=useState(true);
-  const [settingsLoaded,setSettingsLoaded]=useState(false);
   const [busy,setBusy]=useState(false);
   const [scanning,setScanning]=useState(false);
   const [stoppingScan,setStoppingScan]=useState(false);
@@ -437,13 +436,12 @@ function Content(){
   const activeScanIdRef=useRef<number>(0);
   const handledScanIdRef=useRef<number>(0);
   const finishUiScan=useCallback(()=>{scanInFlight.current=false;setScanning(false);setStoppingScan(false);setBusy(false);setUiScanDebug("idle");},[]);
-  const scan=useCallback(async()=>{if(scanInFlight.current)return;scanInFlight.current=true;setBusy(true);setScanning(true);setStoppingScan(false);setUiScanDebug("UI-01 startScan 호출");setResult(prev=>prev?{...prev,unregisteredExecutables:[]}:prev);setSelectedUnregistered(new Set());try{const started=await startScan();activeScanIdRef.current=started.scanId;handledScanIdRef.current=0;setUiScanDebug(`UI-02 scanId ${started.scanId} · 상태 폴링`);}catch(e){finishUiScan();toaster.toast({title:tr("pluginName"),body:tr("scanFailed",{error:String(e)})});}},[finishUiScan]);
+  const scan=useCallback(async()=>{if(scanInFlight.current)return;scanInFlight.current=true;setBusy(true);setScanning(true);setStoppingScan(false);setUiScanDebug("UI-01 startScan 호출");setResult(null);setLastScanLabel(tr("notScannedYet"));setSelected(new Set());setSelectedDuplicates(new Set());setSelectedUnregistered(new Set());setSelectedIgnored(new Set());try{const started=await startScan();activeScanIdRef.current=started.scanId;handledScanIdRef.current=0;setUiScanDebug(`UI-02 scanId ${started.scanId} · 상태 폴링`);}catch(e){finishUiScan();toaster.toast({title:tr("pluginName"),body:tr("scanFailed",{error:String(e)})});}},[finishUiScan]);
   const requestStopScan=useCallback(async()=>{if(!scanInFlight.current||stoppingScan)return;setStoppingScan(true);try{await stopScan();}catch(e){console.warn("[LibraryDoctor] stop_scan failed",e);setStoppingScan(false);}},[stoppingScan]);
   const waitForScanIdle=useCallback(async()=>{for(let i=0;i<80&&scanInFlight.current;i++)await sleep(50);},[]);
   const refreshAfterRemoval=useCallback(async(ids:number[])=>{const removed=new Set(ids);let latest:ScanResult|null=null;for(const delay of POST_REMOVE_DELAYS_MS){await sleep(delay);latest=await scanShortcuts();if(!latest.items.some(i=>i.appId!=null&&removed.has(i.appId)))break;}if(latest)await commitScanResult(latest);},[commitScanResult]);
 
-  useEffect(()=>{let cancelled=false;void(async()=>{try{const s=await getSettings();if(cancelled)return;setWatchedFolders(s.watchedFolders??[]);setRecursiveFolderScan(s.recursiveFolderScan);setIgnoredExecutables(s.ignoredExecutables??[]);setDefaultCompatTool(s.defaultCompatTool??"");}catch(e){if(!cancelled)toaster.toast({title:tr("pluginName"),body:tr("settingsLoadFailed",{error:String(e)})});}finally{if(!cancelled)setSettingsLoaded(true);}})();return()=>{cancelled=true};},[]);
-  useEffect(()=>{if(settingsLoaded)void scan();},[settingsLoaded,scan]);
+  useEffect(()=>{let cancelled=false;void(async()=>{try{const s=await getSettings();if(cancelled)return;setWatchedFolders(s.watchedFolders??[]);setRecursiveFolderScan(s.recursiveFolderScan);setIgnoredExecutables(s.ignoredExecutables??[]);setDefaultCompatTool(s.defaultCompatTool??"");}catch(e){if(!cancelled)toaster.toast({title:tr("pluginName"),body:tr("settingsLoadFailed",{error:String(e)})});}})();return()=>{cancelled=true};},[]);
   useEffect(()=>{
     if(!scanning){setScanStatus(null);return;}
     let cancelled=false;
@@ -707,13 +705,28 @@ function Content(){
         setSaving(true);
         try{
           if(scanInFlight.current){await requestStopScan();await waitForScanIdle();}
+          const foldersChanged=JSON.stringify(nextFolders)!==JSON.stringify(localFolders);
           const saved=await saveSettings(nextFolders,true,ignoredExecutables,nextCompat);
           setLocalFolders(saved.watchedFolders??[]);
           setLocalCompat(saved.defaultCompatTool??"");
           setWatchedFolders(saved.watchedFolders??[]);
           setRecursiveFolderScan(true);
           setDefaultCompatTool(saved.defaultCompatTool??"");
-          void scan();
+          if(foldersChanged){
+            setResult(null);
+            setLastScanLabel(tr("notScannedYet"));
+            setSelected(new Set());
+            setSelectedDuplicates(new Set());
+            setSelectedUnregistered(new Set());
+            setSelectedIgnored(new Set());
+            setOpenGroups({missing:false,offline:false,invalid:false,duplicates:false,folders:false,unregistered:false,ignored:false,del:false});
+            setOpenDuplicateGames(new Set());
+            setOpenUnregisteredGames(new Set());
+            setSelectedCollectionId("");
+            setDelEntries([]);
+            setSelectedDel(new Set());
+            setOpenDelGame(null);
+          }
           return saved;
         }catch(e){
           toaster.toast({title:tr("pluginName"),body:tr("settingsSaveFailed",{error:String(e)})});
