@@ -6,7 +6,7 @@ Decky Loader plugin for cleaning and maintaining non-Steam shortcuts on Steam De
 
 ## Current version
 
-**v0.18.0 · by nach**
+**v0.19.0 · by nach**
 
 ## Features
 
@@ -22,6 +22,10 @@ Decky Loader plugin for cleaning and maintaining non-Steam shortcuts on Steam De
 - Back up `shortcuts.vdf` before shortcut deletion.
 - Korean, Japanese and English UI localization.
 - Scan progress and debug checkpoints for troubleshooting.
+- Storage groups and space-recovery mode for large non-Steam libraries.
+- Internal SSD vs SD/removable storage summaries.
+- Multi-select games and preview total space to free before deletion.
+- Orphan-folder cleanup for game folders found by manual scan but not registered as non-Steam shortcuts.
 
 ## Build
 
@@ -44,8 +48,8 @@ It does **not** install the plugin or restart Decky.
 Push a version tag matching `package.json`, for example:
 
 ```bash
-git tag v0.18.0
-git push origin v0.18.0
+git tag v0.19.0
+git push origin v0.19.0
 ```
 
 GitHub Actions will automatically:
@@ -54,7 +58,7 @@ GitHub Actions will automatically:
 2. Build the plugin.
 3. Package the Decky ZIP.
 4. Create a GitHub Release.
-5. Attach `LibraryDoctor-v0.18.0.zip`.
+5. Attach `LibraryDoctor-v0.19.0.zip`.
 
 The tag version must match the version in `package.json`.
 
