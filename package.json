@@ -1,7 +1,7 @@
 {
   "name": "decky-library-doctor",
-  "version": "0.18.0",
-  "description": "Library Doctor: clean non-Steam shortcuts, discover game EXEs, and safely delete DEL-collection games with path review.",
+  "version": "0.19.0",
+  "description": "Library Doctor: manage large non-Steam libraries, storage usage, orphan folders, shortcuts and cleanup on Steam Deck.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
