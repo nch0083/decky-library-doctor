@@ -17,6 +17,7 @@ class Plugin:
     MAX_DISCOVERED_EXES = 5000
     MAX_ARTWORK_PREVIEW_BYTES = 3 * 1024 * 1024
     ARTWORK_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+    SIZE_CACHE_TTL_SECONDS = 6 * 60 * 60
 
     def _settings_file(self) -> Path:
         return Path(decky.DECKY_PLUGIN_SETTINGS_DIR) / "settings.json"
@@ -862,6 +863,172 @@ class Plugin:
         cancelled = bool(cancel_event is not None and cancel_event.is_set())
         return discovered, "; ".join(errors) if errors else None, truncated, cancelled
 
+
+    def _size_cache_file(self) -> Path:
+        return Path(decky.DECKY_PLUGIN_SETTINGS_DIR) / "folder_sizes.json"
+
+    def _load_size_cache(self):
+        path = self._size_cache_file()
+        if not path.exists():
+            return {"version": 1, "entries": {}}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+                raise ValueError("invalid cache")
+            return data
+        except Exception:
+            return {"version": 1, "entries": {}}
+
+    def _save_size_cache(self, cache):
+        path = self._size_cache_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache, ensure_ascii=True, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(path)
+
+    def _folder_size_sync(self, root: str) -> int:
+        total = 0
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                total += entry.stat(follow_symlinks=False).st_size
+                        except (OSError, PermissionError):
+                            continue
+            except (OSError, PermissionError, FileNotFoundError):
+                continue
+        return total
+
+    def _storage_game_root(self, item, watched):
+        exe = self._canonical_path(item.get("exe", ""))
+        if not exe:
+            return ""
+        matching = []
+        for folder in watched:
+            try:
+                Path(exe).relative_to(folder)
+                matching.append(folder)
+            except (ValueError, OSError):
+                continue
+        for folder in sorted(matching, key=lambda value: len(str(value)), reverse=True):
+            root, _confidence = self._infer_game_root(exe, folder)
+            if root:
+                return self._canonical_path(root)
+        start_dir = self._canonical_path(item.get("startDir", ""))
+        if start_dir and os.path.isdir(start_dir):
+            try:
+                Path(exe).relative_to(Path(start_dir))
+                return start_dir
+            except (ValueError, OSError):
+                pass
+        return self._canonical_path(str(Path(exe).parent))
+
+    def _library_storage_sync(self, force=False):
+        all_items = []
+        for path in self._candidate_shortcuts_files():
+            try:
+                all_items.extend(self._read_shortcuts(path))
+            except Exception as exc:
+                decky.logger.exception("Failed reading %s for storage view: %s", path, exc)
+
+        dedup = {}
+        for item in all_items:
+            key = f"appid:{item['appId']}" if item.get("appId") is not None else f"{item.get('shortcutsFile','')}:{item.get('key','')}"
+            dedup[key] = item
+        items = [item for item in dedup.values() if not item.get("utilityShortcut") and item.get("exe")]
+
+        settings = self._load_settings()
+        watched = [Path(self._canonical_path(str(value))) for value in settings.get("watchedFolders", []) if value]
+        grouped = {}
+        for item in items:
+            root = self._storage_game_root(item, watched)
+            if not root:
+                continue
+            group = grouped.setdefault(root, {
+                "root": root,
+                "name": Path(root).name or item.get("name") or "Unknown",
+                "appIds": [],
+                "names": [],
+                "exe": item.get("exe", ""),
+                "startDir": item.get("startDir", ""),
+            })
+            if item.get("appId") is not None:
+                group["appIds"].append(int(item["appId"]))
+            if item.get("name"):
+                group["names"].append(str(item["name"]))
+
+        cache = self._load_size_cache()
+        cache_entries = cache.setdefault("entries", {})
+        now = time.time()
+        result = []
+        cache_changed = False
+        for root, group in grouped.items():
+            exists = os.path.isdir(root)
+            cached = cache_entries.get(root, {})
+            cache_age = now - float(cached.get("checkedAt") or 0)
+            use_cache = (
+                not force
+                and exists
+                and isinstance(cached.get("sizeBytes"), int)
+                and cache_age >= 0
+                and cache_age < self.SIZE_CACHE_TTL_SECONDS
+            )
+            if use_cache:
+                size_bytes = int(cached["sizeBytes"])
+                checked_at = float(cached.get("checkedAt") or now)
+            else:
+                size_bytes = self._folder_size_sync(root) if exists else 0
+                checked_at = now
+                cache_entries[root] = {"sizeBytes": size_bytes, "checkedAt": checked_at}
+                cache_changed = True
+
+            ok, reason, safe_root = self._validate_delete_target(root, group["exe"])
+            names = list(dict.fromkeys(group["names"]))
+            result.append({
+                "root": safe_root or root,
+                "name": names[0] if len(names) == 1 else group["name"],
+                "sizeBytes": size_bytes,
+                "appIds": list(dict.fromkeys(group["appIds"])),
+                "shortcutCount": len(set(group["appIds"])),
+                "exe": self._canonical_path(group["exe"]),
+                "startDir": group["startDir"],
+                "exists": exists,
+                "canDelete": bool(ok and exists),
+                "reason": reason or ("" if exists else "Game folder is missing."),
+                "cached": bool(use_cache),
+                "storageRoot": self._storage_root(root) or "",
+                "checkedAt": int(checked_at * 1000),
+            })
+
+        live_roots = set(grouped)
+        for key in list(cache_entries):
+            if key not in live_roots and now - float(cache_entries[key].get("checkedAt") or 0) > 7 * 24 * 60 * 60:
+                del cache_entries[key]
+                cache_changed = True
+        if cache_changed:
+            try:
+                self._save_size_cache(cache)
+            except Exception as exc:
+                decky.logger.warning("Could not save folder-size cache: %s", exc)
+
+        result.sort(key=lambda item: (-item["sizeBytes"], item["name"].lower(), item["root"].lower()))
+        return {
+            "games": result,
+            "totalBytes": sum(item["sizeBytes"] for item in result if item["exists"]),
+            "calculatedAt": int(now * 1000),
+            "cacheTtlSeconds": self.SIZE_CACHE_TTL_SECONDS,
+        }
+
+    async def get_library_storage(self, force: bool = False):
+        return await asyncio.to_thread(self._library_storage_sync, bool(force))
 
     async def list_directories(self, path: str):
         """Return browsable child folders for the in-QAM folder browser."""
