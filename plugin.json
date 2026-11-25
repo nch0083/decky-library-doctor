@@ -11,8 +11,8 @@
       "non-steam",
       "cleanup"
     ],
-    "description": "Clean broken and duplicate non-Steam shortcuts, find unregistered game EXEs, and review/delete games queued in the DEL collection."
+    "description": "Manage large non-Steam libraries: broken/duplicate shortcuts, orphan folders, storage usage, and safe cleanup."
   },
-  "version": "0.18.0",
+  "version": "0.19.0",
   "repository": "https://github.com/nch0083/decky-library-doctor"
 }
