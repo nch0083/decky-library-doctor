@@ -35,6 +35,8 @@ type DeletePathInfo = { exePath?:string; deletePath:string; canDelete:boolean; r
 type DeleteFolderResult = { success:boolean; path:string; alreadyMissing?:boolean; error?:string };
 type DelEntry = { appId:number; name:string; exe:string; startDir:string; deletePath:string; canDelete:boolean; reason?:string };
 type UserCollectionSummary = { id:string; name:string; appIds:number[] };
+type StorageGame = { root:string; name:string; sizeBytes:number; appIds:number[]; shortcutCount:number; exe:string; startDir:string; exists:boolean; canDelete:boolean; reason?:string; cached:boolean; storageRoot?:string; checkedAt:number };
+type StorageSummary = { games:StorageGame[]; totalBytes:number; calculatedAt:number; cacheTtlSeconds:number };
 
 const MAX_UNREGISTERED_VISIBLE = 120;
 const POST_REMOVE_DELAYS_MS = [500,800,1200,1600,2200];
@@ -52,6 +54,7 @@ const listDirectories = callable<[string], FolderListing>("list_directories");
 const prepareDeleteCandidate = callable<[string,string], DeletePathInfo>("prepare_delete_candidate");
 const adjustDeletePath = callable<[string,string,string], DeletePathInfo>("adjust_delete_path");
 const deleteGameDirectory = callable<[string,string], DeleteFolderResult>("delete_game_directory");
+const getLibraryStorage = callable<[boolean], StorageSummary>("get_library_storage");
 
 declare const collectionStore:any;
 
@@ -60,6 +63,22 @@ const sectionText:React.CSSProperties={fontSize:"13.5px",lineHeight:"1.2",fontWe
 const actionColors={neutral:"#dcdedf",primary:"#67aefc",success:"#6fd08c",danger:"#ff7070",warning:"#e8bd67"};
 const actionBackgrounds={neutral:"rgba(255,255,255,.07)",primary:"rgba(103,174,252,.16)",success:"rgba(111,208,140,.15)",danger:"rgba(255,112,112,.14)",warning:"rgba(232,189,103,.14)"};
 const actionBorders={neutral:"rgba(255,255,255,.12)",primary:"rgba(103,174,252,.42)",success:"rgba(111,208,140,.40)",danger:"rgba(255,112,112,.40)",warning:"rgba(232,189,103,.40)"};
+
+function formatBytes(value:number):string {
+  if(!Number.isFinite(value)||value<=0)return "0 B";
+  const units=["B","KB","MB","GB","TB"];
+  let n=value,i=0;
+  while(n>=1024&&i<units.length-1){n/=1024;i++;}
+  return `${n>=100||i===0?n.toFixed(0):n>=10?n.toFixed(1):n.toFixed(2)} ${units[i]}`;
+}
+function storageLabel(key:"title"|"load"|"recalc"|"empty"|"total"|"games"|"more"|"delete"|"cached"|"deleteTitle"|"deleteWarn"|"freed"|"failed"):string {
+  const table={
+    en:{title:"Storage",load:"Check sizes",recalc:"Recalculate",empty:"No non-Steam game folders found.",total:"Total",games:"games",more:"Show more",delete:"Delete",cached:"cached",deleteTitle:"Delete game files?",deleteWarn:"The game folder and its non-Steam shortcut(s) will be permanently removed.",freed:"Freed",failed:"Delete failed"},
+    ko:{title:"저장공간",load:"용량 확인",recalc:"다시 계산",empty:"확인된 논스팀 게임 폴더가 없습니다.",total:"합계",games:"게임",more:"더 보기",delete:"삭제",cached:"캐시",deleteTitle:"게임 파일을 삭제할까요?",deleteWarn:"게임 폴더와 연결된 논스팀 바로가기를 함께 영구 삭제합니다.",freed:"확보",failed:"삭제 실패"},
+    ja:{title:"ストレージ",load:"容量を確認",recalc:"再計算",empty:"非Steamゲームフォルダーが見つかりません。",total:"合計",games:"ゲーム",more:"さらに表示",delete:"削除",cached:"キャッシュ",deleteTitle:"ゲームファイルを削除しますか？",deleteWarn:"ゲームフォルダーと関連する非Steamショートカットを完全に削除します。",freed:"解放",failed:"削除失敗"}
+  } as const;
+  return table[UI_LANGUAGE][key];
+}
 
 
 type UiLanguage = "ko" | "en" | "ja";
@@ -416,6 +435,9 @@ function Content(){
   const [delEntries,setDelEntries]=useState<DelEntry[]>([]);
   const [selectedDel,setSelectedDel]=useState<Set<number>>(new Set());
   const [openDelGame,setOpenDelGame]=useState<number|null>(null);
+  const [storageSummary,setStorageSummary]=useState<StorageSummary|null>(null);
+  const [storageBusy,setStorageBusy]=useState(false);
+  const [storageLimit,setStorageLimit]=useState(30);
   const [focusedDashboardCard,setFocusedDashboardCard]=useState<"missing"|"duplicates"|"unregistered"|"ignored"|null>(null);
   const missingSectionRef=useRef<HTMLDivElement|null>(null);
   const duplicateSectionRef=useRef<HTMLDivElement|null>(null);
@@ -554,6 +576,23 @@ function Content(){
       if(unique.length>1)await sleep(MULTI_REMOVE_GAP_MS);
     }
   };
+  const loadStorage=async(force=false)=>{
+    if(storageBusy)return;
+    setStorageBusy(true);
+    try{
+      const summary=await getLibraryStorage(force);
+      setStorageSummary(summary);
+      setStorageLimit(30);
+    }catch(e){
+      toaster.toast({title:tr("pluginName"),body:String(e)});
+    }finally{setStorageBusy(false);}
+  };
+  const deleteStorageGame=async(game:StorageGame)=>{
+    if(storageBusy||!game.canDelete)return;
+    const Confirm=({closeModal}:{closeModal?:()=>void})=><ModalRoot onCancel={()=>closeModal?.()}><div style={{padding:"10px 16px 18px",minWidth:"520px",maxWidth:"700px"}}><h2>{storageLabel("deleteTitle")}</h2><div style={{fontSize:"14px",fontWeight:800,margin:"8px 0"}}>{game.name} · {formatBytes(game.sizeBytes)}</div><div style={{fontSize:"10px",opacity:.65,wordBreak:"break-all",marginBottom:"10px"}}>{game.root}</div><p style={{fontSize:"13px",lineHeight:1.45,color:actionColors.danger,fontWeight:800}}>{storageLabel("deleteWarn")}</p><DirectionalNavZone orientation="horizontal" lockCross style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px",marginTop:"14px"}}><DialogButton onClick={()=>closeModal?.()}>{tr("cancel")}</DialogButton><DialogButton onClick={()=>{closeModal?.();void (async()=>{setStorageBusy(true);try{const backup=await backupShortcuts();if(!backup.success)throw new Error(backup.error||"Backup failed");const removed=await deleteGameDirectory(game.root,game.exe);if(!removed.success)throw new Error(removed.error||storageLabel("failed"));if(game.appIds.length)await removeShortcutsReliably(game.appIds);setResult(null);setLastScanLabel(tr("notScannedYet"));setSelected(new Set());setSelectedDuplicates(new Set());setSelectedUnregistered(new Set());setSelectedIgnored(new Set());setDelEntries([]);setSelectedDel(new Set());setOpenDelGame(null);const refreshed=await getLibraryStorage(true);setStorageSummary(refreshed);toaster.toast({title:tr("pluginName"),body:`${storageLabel("freed")} ${formatBytes(game.sizeBytes)}`});}catch(e){toaster.toast({title:tr("pluginName"),body:`${storageLabel("failed")}: ${String(e)}`});}finally{setStorageBusy(false);}})();}} style={{color:actionColors.danger,fontWeight:800}}>{storageLabel("delete")}</DialogButton></DirectionalNavZone></div></ModalRoot>;
+    showModal(<Confirm/>);
+  };
+
   const removeAppIds=async(ids:number[])=>{if(!ids.length)return;setBusy(true);try{const backup=await backupShortcuts();if(!backup.success){toaster.toast({title:tr("pluginName"),body:tr("backupFailed",{error:backup.error??""})});return;}await removeShortcutsReliably(ids);toaster.toast({title:tr("pluginName"),body:tr("removedRefreshing",{count:ids.length})});await refreshAfterRemoval(ids);}catch(e){toaster.toast({title:tr("pluginName"),body:tr("removeFailed",{error:String(e)})});}finally{setBusy(false);}};
   const confirmRemoval=(ids:number[])=>showDeleteConfirm(ids,()=>void removeAppIds(ids));
 
@@ -787,6 +826,28 @@ function Content(){
           return <Focusable key={card.key} flow-children="right" noFocusRing onGamepadFocus={()=>setFocusedDashboardCard(card.key)} onGamepadBlur={()=>setFocusedDashboardCard(cur=>cur===card.key?null:cur)} onFocus={()=>setFocusedDashboardCard(card.key)} onBlur={(e)=>{if(!e.currentTarget.contains(e.relatedTarget as Node|null))setFocusedDashboardCard(cur=>cur===card.key?null:cur);}} style={{width:"100%",minWidth:0}}><DialogButton onClick={()=>jumpToSection(card.key,card.ref)} style={{width:"100%",minWidth:0,minHeight:"40px",margin:0,padding:"4px 8px",display:"block",textAlign:"left",borderRadius:"7px",boxSizing:"border-box",color:"#fff",background:active?`linear-gradient(90deg, ${String(card.color)}34, rgba(255,255,255,.075))`:"rgba(255,255,255,.055)",outline:active?`2px solid ${String(card.color)}`:"2px solid transparent",outlineOffset:"-2px",boxShadow:active?`inset 0 0 0 1px ${String(card.color)}44, 0 0 10px ${String(card.color)}22`:"none",transform:active?"scale(.985)":"none",transition:"background .14s ease, outline-color .14s ease, box-shadow .14s ease, transform .14s ease"}}>{cardBody}</DialogButton></Focusable>;
         })}</DirectionalNavZone>)}
       </DirectionalNavZone></PanelSectionRow>}
+    </PanelSection>
+
+    <PanelSection title={storageLabel("title")}>
+      <PanelSectionRow><div style={{width:"100%"}}>
+        <DirectionalNavZone orientation="horizontal" style={{display:"grid",gridTemplateColumns:storageSummary?"1fr 1fr":"1fr",gap:"8px",width:"100%"}}>
+          <ActionButton tone="primary" onClick={()=>void loadStorage(false)} disabled={storageBusy}>{storageBusy?tr("loading"):storageLabel("load")}</ActionButton>
+          {storageSummary&&<ActionButton tone="neutral" onClick={()=>void loadStorage(true)} disabled={storageBusy}>{storageLabel("recalc")}</ActionButton>}
+        </DirectionalNavZone>
+        {storageSummary&&<div style={{marginTop:"7px",padding:"7px 9px",borderRadius:"8px",background:"rgba(255,255,255,.04)",display:"flex",justifyContent:"space-between",gap:"8px",fontSize:"11px"}}><span>{storageSummary.games.length} {storageLabel("games")}</span><strong>{storageLabel("total")} {formatBytes(storageSummary.totalBytes)}</strong></div>}
+      </div></PanelSectionRow>
+      {storageSummary&&storageSummary.games.length===0&&<PanelSectionRow><div style={{fontSize:"11px",opacity:.62,padding:"4px"}}>{storageLabel("empty")}</div></PanelSectionRow>}
+      {storageSummary&&storageSummary.games.slice(0,storageLimit).map(game=><PanelSectionRow key={game.root}><div style={{width:"calc(100% - 4px)",margin:"0 2px",padding:"6px 7px",boxSizing:"border-box",borderRadius:"8px",background:"rgba(255,255,255,.03)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <div style={{flex:"1 1 auto",minWidth:0}}>
+            <div style={{display:"flex",alignItems:"baseline",gap:"6px",minWidth:0}}><span style={{fontSize:"11.5px",fontWeight:800,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{game.name}</span><span style={{fontSize:"12px",fontWeight:900,color:actionColors.primary,whiteSpace:"nowrap"}}>{formatBytes(game.sizeBytes)}</span>{game.cached&&<span style={{fontSize:"8px",opacity:.42}}>{storageLabel("cached")}</span>}</div>
+            <div style={{fontSize:"8.5px",opacity:.48,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{shortDisplayPath(game.root)}{game.shortcutCount>1?` · ${game.shortcutCount} shortcuts`:""}</div>
+          </div>
+          <CompactIconButton label={storageLabel("delete")} tone="danger" onClick={()=>void deleteStorageGame(game)} disabled={storageBusy||!game.canDelete}><FaTrash/></CompactIconButton>
+        </div>
+        {!game.canDelete&&game.reason&&<div style={{fontSize:"8.5px",color:actionColors.warning,marginTop:"3px"}}>{game.reason}</div>}
+      </div></PanelSectionRow>)}
+      {storageSummary&&storageLimit<storageSummary.games.length&&<PanelSectionRow><ActionButton tone="neutral" onClick={()=>setStorageLimit(v=>v+30)}>{storageLabel("more")} ({Math.min(30,storageSummary.games.length-storageLimit)})</ActionButton></PanelSectionRow>}
     </PanelSection>
 
     {result&&result.missing>0&&<div ref={missingSectionRef}><PanelSection title=""><PanelSectionRow><SectionToggle tone="danger" open={openGroups.missing} label={tr("missingExecutable")} count={result.missing} onClick={()=>toggleGroup("missing")}/></PanelSectionRow>{openGroups.missing&&<>{renderShortcutRows(itemsByStatus.missing)}{selected.size>0&&<PanelSectionRow><ActionButton tone="danger" onClick={()=>confirmRemoval([...selected])} disabled={busy}>{tr("removeSelected",{count:selected.size})}</ActionButton></PanelSectionRow>}</>}</PanelSection></div>}
