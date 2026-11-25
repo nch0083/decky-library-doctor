@@ -1,6 +1,6 @@
 {
   "name": "decky-library-doctor",
-  "version": "0.17.4",
+  "version": "0.18.0",
   "description": "Library Doctor: clean non-Steam shortcuts, discover game EXEs, and safely delete DEL-collection games with path review.",
   "type": "module",
   "scripts": {
