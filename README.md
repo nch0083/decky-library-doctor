@@ -2,6 +2,8 @@
 
 Decky Loader plugin for cleaning and maintaining non-Steam shortcuts on Steam Deck.
 
+스팀덱의 논스팀 바로가기를 정리하고, 게임 폴더별 용량 확인 및 삭제를 통해 저장공간을 관리할 수 있는 Decky Loader 플러그인입니다.
+
 ## Current version
 
 **v0.18.0 · by nach**
